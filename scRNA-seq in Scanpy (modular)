@@ -1,0 +1,372 @@
+"""
+scRNA-seq analysis of mislabelled 'bone_marrow.h5ad'
+
+Pipeline:
+- Load data
+- QC gene flags (MT/RIBO/HB) & QC metrics
+- Cell-level QC filtering
+- Doublet detection with Scrublet (Scanpy wrapper)
+- Normalisation, log1p, HVGs
+- PCA, neighbors, UMAP, Leiden clustering
+- Cell-type scoring with decoupler + PanglaoDB
+- Automatic cell-type annotation
+- Cell-type proportions summary
+"""
+
+import scanpy as sc
+import scanpy.external as sce
+import anndata as ad
+import pandas as pd
+import decoupler as dc
+
+
+# ---------- 1. Data loading ----------
+
+def load_data(path: str) -> ad.AnnData:
+    """
+    Load an AnnData object from disk and ensure unique cell and gene names.
+
+    Parameters
+    ----------
+    path : str
+        Path to .h5ad file.
+
+    Returns
+    -------
+    AnnData
+        AnnData object with unique var_names and obs_names.
+    """
+    adata = sc.read_h5ad(path)
+    adata.var_names_make_unique()
+    adata.obs_names_make_unique()
+    return adata
+
+
+# ---------- 2. Gene-level QC flags & QC metrics ----------
+
+def add_qc_gene_flags(adata: ad.AnnData) -> ad.AnnData:
+    """
+    Add MT, RIBO and HB boolean flags to adata.var for QC.
+
+    MT  : genes starting with 'MT-'
+    RIBO: genes starting with 'RPS' or 'RPL'
+    HB  : selected hemoglobin genes
+    """
+    hb_gene_list = ["HBA1", "HBA2", "HBB", "HBD", "HBG1", "HBG2"]
+
+    adata.var["MT"] = adata.var_names.str.startswith("MT-")
+    adata.var["RIBO"] = adata.var_names.str.startswith(("RPS", "RPL"))
+
+    sym_upper = adata.var_names.str.upper()
+    adata.var["HB"] = sym_upper.isin(hb_gene_list)
+
+    return adata
+
+
+def compute_qc_metrics(adata: ad.AnnData) -> ad.AnnData:
+    """
+    Compute per-cell QC metrics using MT/RIBO/HB flags.
+    """
+    sc.pp.calculate_qc_metrics(
+        adata,
+        qc_vars=["MT", "RIBO", "HB"],
+        inplace=True,
+        log1p=True,
+    )
+    return adata
+
+
+# ---------- 3. Cell-level QC filtering ----------
+
+def filter_cells_and_genes(
+    adata: ad.AnnData,
+    min_genes: int = 200,
+    min_cells: int = 3,
+    mt_max: float = 20.0,
+    ribo_max: float = 20.0,
+    hb_max: float = 20.0,
+) -> ad.AnnData:
+    """
+    Filter low-quality cells and rarely detected genes.
+
+    Parameters
+    ----------
+    min_genes : int
+        Minimum genes per cell.
+    min_cells : int
+        Minimum cells per gene.
+    mt_max, ribo_max, hb_max : float
+        Maximum allowed % counts for MT/RIBO/HB.
+    """
+    sc.pp.filter_cells(adata, min_genes=min_genes)
+    sc.pp.filter_genes(adata, min_cells=min_cells)
+
+    adata = adata[adata.obs["pct_counts_MT"] < mt_max, :].copy()
+    adata = adata[adata.obs["pct_counts_RIBO"] < ribo_max, :].copy()
+    adata = adata[adata.obs["pct_counts_HB"] < hb_max, :].copy()
+
+    return adata
+
+
+# ---------- 4. Doublet detection with Scrublet ----------
+
+def run_scrublet(
+    adata: ad.AnnData,
+    expected_doublet_rate: float = 0.06,
+) -> ad.AnnData:
+    """
+    Run Scrublet via Scanpy external wrapper and store doublet_score
+    and predicted_doublet in adata.obs. Filters out predicted doublets.
+
+    Parameters
+    ----------
+    expected_doublet_rate : float
+        Prior expected doublet fraction (e.g. 0.06).
+
+    Returns
+    -------
+    AnnData
+        AnnData object with doublet annotations; predicted doublets removed.
+    """
+    # Run Scrublet via Scanpy external API
+    doublet_scores, predicted_doublets = sce.pp.scrublet(
+        adata,
+        expected_doublet_rate=expected_doublet_rate,
+        copy=False,
+    )
+
+    # Columns are already added to adata.obs by sce.pp.scrublet,
+    # but we keep the return for clarity.
+    adata.obs["doublet_score"] = doublet_scores
+    adata.obs["predicted_doublet"] = predicted_doublets.astype(bool)
+
+    # Filter out predicted doublets
+    before = adata.n_obs
+    adata = adata[adata.obs["predicted_doublet"] == False].copy()
+    after = adata.n_obs
+    print(f"Removed {before - after} predicted doublets; remaining {after} cells.")
+    return adata
+
+
+# ---------- 5. Normalisation, log1p, HVGs ----------
+
+def normalize_and_select_hvgs(
+    adata: ad.AnnData,
+    n_top_genes: int = 1000,
+) -> ad.AnnData:
+    """
+    Normalize counts per cell, log-transform, and select highly variable genes.
+
+    Parameters
+    ----------
+    n_top_genes : int
+        Number of HVGs to keep.
+
+    Returns
+    -------
+    AnnData
+        AnnData restricted to HVGs.
+    """
+    # keep raw counts
+    adata.layers["counts"] = adata.X.copy()
+
+    sc.pp.normalize_total(adata)
+    sc.pp.log1p(adata)
+
+    sc.pp.highly_variable_genes(adata, n_top_genes=n_top_genes)
+    # optionally subset to HVGs for downstream steps
+    # adata = adata[:, adata.var["highly_variable"]].copy()
+    return adata
+
+
+# ---------- 6. PCA, neighbors, UMAP, Leiden ----------
+
+def run_dimensionality_reduction_and_clustering(
+    adata: ad.AnnData,
+    n_neighbors: int = 15,
+    n_pcs: int = 30,
+    resolutions=(0.02, 0.5, 2.0),
+) -> ad.AnnData:
+    """
+    Run PCA, neighbor graph, UMAP, and Leiden clustering at multiple resolutions.
+
+    Parameters
+    ----------
+    n_neighbors : int
+        Number of neighbors for kNN graph.
+    n_pcs : int
+        Number of principal components to use.
+    resolutions : tuple of float
+        Leiden resolutions to compute.
+    """
+    sc.tl.pca(adata)
+    sc.pp.neighbors(adata, n_neighbors=n_neighbors, n_pcs=n_pcs)
+    sc.tl.umap(adata)
+
+    for res in resolutions:
+        key = f"leiden_res{res}".replace(".", "_")
+        sc.tl.leiden(adata, flavor="igraph", n_iterations=2,
+                     key_added=key, resolution=res)
+
+    return adata
+
+
+# ---------- 7. PanglaoDB / decoupler scoring ----------
+
+def get_panglaodb_markers(organism: str = "human") -> pd.DataFrame:
+    """
+    Retrieve PanglaoDB canonical markers via decoupler and format as a network.
+
+    Returns
+    -------
+    DataFrame with columns ['source', 'target'] for cell-type and gene symbol.
+    """
+    markers = dc.op.resource(name="PanglaoDB", organism=organism)
+    markers = markers[markers["canonical_marker"]]
+    markers = markers[~markers.duplicated(["cell_type", "genesymbol"])]
+    markers = markers.rename(columns={"cell_type": "source", "genesymbol": "target"})
+    markers = markers[["source", "target"]]
+    return markers
+
+
+def score_cell_types_with_ulm(
+    adata: ad.AnnData,
+    markers: pd.DataFrame,
+    feature_name_col: str = "feature_name",
+) -> ad.AnnData:
+    """
+    Run decoupler's ULM method using PanglaoDB markers.
+
+    Parameters
+    ----------
+    feature_name_col : str
+        Column in adata.var containing gene symbols compatible with markers.
+
+    Returns
+    -------
+    AnnData with 'score_ulm' scores in adata.obsm.
+    """
+    # Align var_names to gene symbols used by markers
+    if feature_name_col in adata.var.columns:
+        adata.var_names = pd.Index(adata.var[feature_name_col].astype(str))
+        adata.var_names_make_unique()
+
+    dc.mt.ulm(data=adata, net=markers, tmin=3)
+    return adata
+
+
+# ---------- 8. Automatic cluster annotation ----------
+
+def auto_annotate_clusters_from_scores(
+    adata: ad.AnnData,
+    groupby: str = "leiden_res0_5",
+    obsm_key: str = "score_ulm",
+    obs_key: str = "cell_type",
+) -> ad.AnnData:
+    """
+    Use decoupler scores to assign a dominant cell-type label per cluster.
+
+    Parameters
+    ----------
+    groupby : str
+        Column in adata.obs containing cluster IDs.
+    obsm_key : str
+        Key in adata.obsm where score matrix is stored.
+    obs_key : str
+        Column to write final cell-type labels to.
+    """
+    score = dc.pp.get_obsm(adata, key=obsm_key)
+
+    rank_df = dc.tl.rankby_group(
+        score,
+        groupby=groupby,
+        reference="rest",
+        method="t-test_overestim_var",
+    )
+    rank_df = rank_df[rank_df["stat"] > 0]
+
+    cluster_to_celltype = (
+        rank_df
+        .sort_values(["group", "stat"], ascending=[True, False])
+        .groupby("group")
+        .head(1)
+        .set_index("group")["name"]
+        .to_dict()
+    )
+
+    adata.obs[obs_key] = (
+        adata.obs[groupby].map(cluster_to_celltype)
+    ).astype("category")
+
+    return adata
+
+
+# ---------- 9. Cell-type proportions ----------
+
+def get_cell_type_proportions(
+    adata: ad.AnnData,
+    cell_type_key: str = "cell_type",
+) -> pd.Series:
+    """
+    Compute normalized cell-type proportions.
+
+    Returns
+    -------
+    Series
+        Index: cell types, values: proportions (0–1).
+    """
+    return (
+        adata.obs[cell_type_key]
+        .value_counts(normalize=True)
+        .sort_values(ascending=False)
+    )
+
+
+# ---------- Main entry point ----------
+
+def main():
+    # 1. Load
+    adata = load_data("bone_marrow.h5ad")
+    print(adata)
+
+    # 2. QC flags & metrics
+    adata = add_qc_gene_flags(adata)
+    adata = compute_qc_metrics(adata)
+
+    # 3. Cell-level filtering
+    adata = filter_cells_and_genes(adata)
+
+    # 4. Doublet detection
+    adata = run_scrublet(adata, expected_doublet_rate=0.06)
+
+    # 5. Normalisation & HVGs
+    adata = normalize_and_select_hvgs(adata, n_top_genes=1000)
+
+    # 6. PCA / neighbors / UMAP / Leiden
+    adata = run_dimensionality_reduction_and_clustering(
+        adata,
+        n_neighbors=15,
+        n_pcs=30,
+        resolutions=(0.02, 0.5, 2.0),
+    )
+
+    # 7. PanglaoDB markers & scoring
+    markers = get_panglaodb_markers(organism="human")
+    adata = score_cell_types_with_ulm(adata, markers)
+
+    # 8. Automatic annotation using leiden_res0_5
+    adata = auto_annotate_clusters_from_scores(
+        adata,
+        groupby="leiden_res0_5",
+        obsm_key="score_ulm",
+        obs_key="cell_type",
+    )
+
+    # 9. Proportions
+    props = get_cell_type_proportions(adata, cell_type_key="cell_type")
+    print("Cell-type proportions:")
+    print(props)
+
+
+if __name__ == "__main__":
+    main()
